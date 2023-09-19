@@ -1,7 +1,6 @@
 package insightcloudsec
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,16 +16,20 @@ type Users interface {
 	CreateSAMLUser(saml_user SAMLUser) (UserDetails, error)
 	CurrentUserInfo() (UserDetails, error)
 	ConvertToAPIOnly(user_id int) (APIKey_Response, error)
-	Get2FAStatus(user_id int32) (UsersMFAStatus, error)
+	Get2FAStatus(user_id int) (UsersMFAStatus, error)
 	GetUserByID(user_id int) (UserDetails, error)
 	GetUserByUsername(username string) (UserDetails, error)
 	Enable2FACurrentUser() (OTP, error)
-	Disable2FA(user_id int32) error
+	Disable2FA(user_id int) error
 	DeactivateAPIKeys(user_id int) error
 	Delete(user_resource_id string) error
 	DeleteByUsername(username string) error
 	List() (UserList, error)
+	ListDomainAdmins() (UserList, error)
+	ListAll() (UserList, error)
 	SetConsoleAccess(user_id int, access bool) error
+	UpdateUserInfo(user_id int, name string, username string, email string, access_level string) (UserDetails, error)
+	EditAccessLevel(user_id int, current string, desired string) (UserDetails, error)
 }
 
 type users struct {
@@ -111,7 +114,7 @@ type UserList struct {
 }
 
 type UserIDPayload struct {
-	UserID int32 `json:"user_id,omitempty"`
+	UserID int `json:"user_id,omitempty"`
 }
 
 type UserIDPayloadString struct {
@@ -136,12 +139,23 @@ type ConsoleDeniedRequest struct {
 	Access bool   `json:"console_access_denied"`
 }
 
+type UserInfoUpdate struct {
+	Username    string `json:"username"`
+	Name        string `json:"name"`
+	Email       string `json:"email"`
+	AccessLevel string `json:"access_level"`
+}
+
+type AccessLevelChange struct {
+	Current string `json:"current_access_level"`
+	Desired string `json:"new_access_level"`
+}
+
 // USER FUNCTIONS
 
-func (c *users) List() (UserList, error) {
-	// List all InsightCloudSec users
-
-	resp, err := c.client.makeRequest(http.MethodGet, "/v2/public/users/list", nil)
+func (u *users) List() (UserList, error) {
+	// List all InsightCloudSec users (non-Domain Admins)
+	resp, err := u.client.makeRequest(http.MethodGet, "/v2/public/users/list", nil)
 	if err != nil {
 		return UserList{}, err
 	}
@@ -154,9 +168,44 @@ func (c *users) List() (UserList, error) {
 	return ret, nil
 }
 
-func (c *users) Create(user User) (UserDetails, error) {
+func (u *users) ListDomainAdmins() (UserList, error) {
+	// List domain admins in InsightCloudSec
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/prototype/domains/admins/list", nil)
+	if err != nil {
+		return UserList{}, err
+	}
+
+	var ret UserList
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+		return UserList{}, err
+	}
+	ret.Count = len(ret.Users)
+
+	return ret, nil
+}
+
+func (u *users) ListAll() (UserList, error) {
+	//  Return one list of both domain admins and regular users
+	regular_users, err := u.List()
+	if err != nil {
+		return UserList{}, err
+	}
+	domain_admins, err := u.ListDomainAdmins()
+	if err != nil {
+		return UserList{}, err
+	}
+
+	var combined UserList
+	combined.Count = regular_users.Count + domain_admins.Count
+	combined.Users = append(regular_users.Users, domain_admins.Users...)
+
+	return combined, nil
+}
+
+func (u *users) Create(user User) (UserDetails, error) {
 	// Creates an InsightCloudSec User account
 
+	// If required values are empty, return error
 	if user.AccessLevel == "" || user.Name == "" || user.Username == "" || user.Email == "" {
 		return UserDetails{}, fmt.Errorf("[-] user's name, username, email, password and accesslevel must be set")
 	}
@@ -171,12 +220,7 @@ func (c *users) Create(user User) (UserDetails, error) {
 		return UserDetails{}, fmt.Errorf("[-] user.AccessLevel must be one of: BASIC_USER, ORGANIZATION_ADMIN, DOMAIN_VIEWER, or DOMAIN_ADMIN")
 	}
 
-	data, err := json.Marshal(user)
-	if err != nil {
-		return UserDetails{}, err
-	}
-
-	resp, err := c.client.makeRequest(http.MethodPost, "/v2/public/user/create", bytes.NewBuffer(data))
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/create", user)
 	if err != nil {
 		return UserDetails{}, err
 	}
@@ -189,7 +233,7 @@ func (c *users) Create(user User) (UserDetails, error) {
 	return ret, nil
 }
 
-func (c *users) CreateAPIUser(api_user APIUser) (APIUserResponse, error) {
+func (u *users) CreateAPIUser(api_user APIUser) (APIUserResponse, error) {
 	// Creates an InsightCloudSec API Only User
 
 	if api_user.Username == "" || api_user.Email == "" || api_user.Name == "" {
@@ -198,12 +242,7 @@ func (c *users) CreateAPIUser(api_user APIUser) (APIUserResponse, error) {
 
 	api_user.AuthenticationType = "internal"
 
-	data, err := json.Marshal(api_user)
-	if err != nil {
-		return APIUserResponse{}, err
-	}
-
-	resp, err := c.client.makeRequest(http.MethodPost, "/v2/public/user/create_api_only_user", bytes.NewBuffer(data))
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/create_api_only_user", api_user)
 	if err != nil {
 		return APIUserResponse{}, err
 	}
@@ -215,12 +254,8 @@ func (c *users) CreateAPIUser(api_user APIUser) (APIUserResponse, error) {
 }
 
 func (u *users) CreateSAMLUser(saml_user SAMLUser) (UserDetails, error) {
-	payload, err := json.Marshal(saml_user)
-	if err != nil {
-		return UserDetails{}, err
-	}
-
-	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/create", bytes.NewBuffer(payload))
+	// Creates a SAML User
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/create", saml_user)
 	if err != nil {
 		return UserDetails{}, err
 	}
@@ -244,12 +279,12 @@ func (u *users) Delete(user_resource_id string) error {
 	return nil
 }
 
-func (c *users) DeleteByUsername(username string) error {
+func (u *users) DeleteByUsername(username string) error {
 	// Deletes the user corresponding to the given username.
 	//
 	// Example usage: client.DeleteUserByUsername("jdoe")
 
-	users, err := c.List()
+	users, err := u.ListAll()
 	if err != nil {
 		return err
 	}
@@ -265,7 +300,7 @@ func (c *users) DeleteByUsername(username string) error {
 		return fmt.Errorf("[-] ERROR: Username not found")
 	}
 
-	err = c.Delete(id)
+	err = u.Delete(id)
 	if err != nil {
 		return err
 	}
@@ -287,14 +322,9 @@ func (u *users) CurrentUserInfo() (UserDetails, error) {
 	return user, nil
 }
 
-func (u *users) Get2FAStatus(user_id int32) (UsersMFAStatus, error) {
-	id := UserIDPayload{UserID: user_id}
-	payload, err := json.Marshal(id)
-	if err != nil {
-		return UsersMFAStatus{}, err
-	}
-
-	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/tfa_state", bytes.NewBuffer(payload))
+func (u *users) Get2FAStatus(user_id int) (UsersMFAStatus, error) {
+	// Gets the 2FA status for user of given user_id
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/tfa_state", UserIDPayload{UserID: user_id})
 	if err != nil {
 		return UsersMFAStatus{}, err
 	}
@@ -308,6 +338,7 @@ func (u *users) Get2FAStatus(user_id int32) (UsersMFAStatus, error) {
 }
 
 func (u *users) Enable2FACurrentUser() (OTP, error) {
+	// Enables 2FA for current user
 	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/tfa_enable", nil)
 	if err != nil {
 		return OTP{}, err
@@ -319,12 +350,9 @@ func (u *users) Enable2FACurrentUser() (OTP, error) {
 	return ret, nil
 }
 
-func (u *users) Disable2FA(user_id int32) error {
-	payload, err := json.Marshal(UserIDPayload{UserID: user_id})
-	if err != nil {
-		return err
-	}
-	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/tfa_disable", bytes.NewBuffer(payload))
+func (u *users) Disable2FA(user_id int) error {
+	// Disables 2FA for user of given user_id
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/tfa_disable", UserIDPayload{UserID: user_id})
 	if err != nil {
 		return err
 	}
@@ -342,11 +370,8 @@ func (u *users) Disable2FA(user_id int32) error {
 }
 
 func (u *users) ConvertToAPIOnly(user_id int) (APIKey_Response, error) {
-	payload, err := json.Marshal(UserIDPayloadString{UserID: strconv.Itoa(user_id)})
-	if err != nil {
-		return APIKey_Response{}, err
-	}
-	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/update_to_api_only_user", bytes.NewBuffer(payload))
+	// Converts user of given user_id to API Only User
+	resp, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/update_to_api_only_user", UserIDPayloadString{UserID: strconv.Itoa(user_id)})
 	if err != nil {
 		return APIKey_Response{}, err
 	}
@@ -359,11 +384,8 @@ func (u *users) ConvertToAPIOnly(user_id int) (APIKey_Response, error) {
 }
 
 func (u *users) SetConsoleAccess(user_id int, access bool) error {
-	payload, err := json.Marshal(ConsoleDeniedRequest{UserID: strconv.Itoa(user_id), Access: access})
-	if err != nil {
-		return err
-	}
-	_, err = u.client.makeRequest(http.MethodPost, "/v2/public/user/update_console_access", bytes.NewBuffer(payload))
+	//Sets the console access for given user_id
+	_, err := u.client.makeRequest(http.MethodPost, "/v2/public/user/update_console_access", ConsoleDeniedRequest{UserID: strconv.Itoa(user_id), Access: access})
 	if err != nil {
 		return err
 	}
@@ -372,11 +394,8 @@ func (u *users) SetConsoleAccess(user_id int, access bool) error {
 }
 
 func (u *users) DeactivateAPIKeys(user_id int) error {
-	payload, err := json.Marshal(UserIDPayloadString{UserID: strconv.Itoa(user_id)})
-	if err != nil {
-		return err
-	}
-	_, err = u.client.makeRequest(http.MethodPost, "/v2/public/apikey/deactivate", bytes.NewBuffer(payload))
+	// Deactivates the API Keys for user of given user_id
+	_, err := u.client.makeRequest(http.MethodPost, "/v2/public/apikey/deactivate", UserIDPayloadString{UserID: strconv.Itoa(user_id)})
 	if err != nil {
 		return err
 	}
@@ -384,7 +403,7 @@ func (u *users) DeactivateAPIKeys(user_id int) error {
 }
 
 func (u *users) GetUserByUsername(username string) (UserDetails, error) {
-	listOfUsers, err := u.client.Users.List()
+	listOfUsers, err := u.client.Users.ListAll()
 	if err != nil {
 		return UserDetails{}, err
 	}
@@ -399,7 +418,7 @@ func (u *users) GetUserByUsername(username string) (UserDetails, error) {
 }
 
 func (u *users) GetUserByID(user_id int) (UserDetails, error) {
-	listOfUsers, err := u.client.Users.List()
+	listOfUsers, err := u.client.Users.ListAll()
 	if err != nil {
 		return UserDetails{}, err
 	}
@@ -411,4 +430,34 @@ func (u *users) GetUserByID(user_id int) (UserDetails, error) {
 	}
 
 	return UserDetails{}, fmt.Errorf("[-] ERROR: Found no user with user_id: %d", user_id)
+}
+
+func (u *users) UpdateUserInfo(user_id int, name string, username string, email string, access_level string) (UserDetails, error) {
+	payload := UserInfoUpdate{Name: name, Username: username, Email: email, AccessLevel: access_level}
+	resp, err := u.client.makeRequest(http.MethodPost, fmt.Sprintf("/v2/prototype/user/divvyuser:%d:/update", user_id), payload)
+	if err != nil {
+		return UserDetails{}, err
+	}
+
+	var ret UserDetails
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+		return UserDetails{}, err
+	}
+
+	return ret, nil
+}
+
+func (u *users) EditAccessLevel(user_id int, current string, desired string) (UserDetails, error) {
+	payload := AccessLevelChange{Current: current, Desired: desired}
+	resp, err := u.client.makeRequest(http.MethodPost, fmt.Sprintf("/v2/public/user/divvyuser:%d:/edit-access-level", user_id), payload)
+	if err != nil {
+		return UserDetails{}, err
+	}
+
+	var ret UserDetails
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+		return UserDetails{}, err
+	}
+
+	return ret, nil
 }

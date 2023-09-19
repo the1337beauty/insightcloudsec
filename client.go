@@ -1,8 +1,9 @@
 package insightcloudsec
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -44,6 +45,7 @@ type Client struct {
 	Badges                Badges
 	Bots                  Bots
 	Clouds                Clouds
+	CloudOrgs             CloudOrganizations
 	Filters               Filters
 	Insights              Insights
 	Organizations         Organizations
@@ -98,14 +100,23 @@ func NewClient(cfg *Config) (*Client, error) {
 	client.Resources = &resources{client: client}
 	client.ResourceGroups = &rsgroup{client: client}
 	client.Iac = &iac{client: client}
+	client.CloudOrgs = &corgs{client: client}
+
 	return client, nil
 }
 
-func (c Client) makeRequest(method, path string, data io.Reader) (*http.Response, error) {
+func (c Client) makeRequest(method, path string, data interface{}) (*http.Response, error) {
+
+	// Marshall json if data is not nil
+	byte_data, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("[-] ERROR: Marshal error: %s", err)
+	}
+
 	req, err := http.NewRequest(
 		method,
 		fmt.Sprintf("%s%s", c.baseURL, path),
-		data,
+		bytes.NewBuffer(byte_data),
 	)
 	if err != nil {
 		return nil, err
@@ -123,6 +134,7 @@ func (c Client) makeRequest(method, path string, data io.Reader) (*http.Response
 			Message:    resp.Status,
 		}
 	}
+
 	return resp, nil
 }
 
