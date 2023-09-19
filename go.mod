@@ -1,4 +1,4 @@
-module github.com/gstotts/insightcloudsec
+module github.com/the1337beauty/insightcloudsec
 
 go 1.19
 
